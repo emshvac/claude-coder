@@ -5,10 +5,64 @@ import { ApiHistoryItem } from "../agent/v1"
 import { WebSearchResponseDto } from "./interfaces"
 import { KODU_ERROR_CODES, KoduError, koduSSEResponse } from "../shared/kodu"
 
+interface AnthropicMessage {
+    usage?: {
+        input_tokens: number;
+        output_tokens: number;
+    };
+    metadata?: {
+        cached?: boolean;
+    };
+}
+
+interface AnthropicDelta {
+    usage?: {
+        output_tokens: number;
+    };
+    content?: Array<{
+        type: string;
+        text?: string;
+    }>;
+}
+
+type StreamState = {
+    currentText: string;
+    accumulatedContent: Array<{
+        type: 'text';
+        text: string;
+    }>;
+    usage: {
+        input_tokens: number;
+        output_tokens: number;
+        cache_creation_input_tokens: number;
+        cache_read_input_tokens: number;
+    };
+    messageMetadata?: {
+        cached?: boolean;
+    };
+    toolResponse?: {
+        text: string;
+        complete: boolean;
+        isCompletionTool: boolean;
+    };
+    isProcessingTool: boolean;
+}
+
 export class AnthropicDirectHandler implements ApiHandler {
     private options: ApiHandlerOptions
     private client: Anthropic
     private abortController: AbortController | null = null
+    private streamState: StreamState = {
+        currentText: '',
+        accumulatedContent: [],
+        usage: {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0
+        },
+        isProcessingTool: false
+    }
 
     constructor(options: ApiHandlerOptions) {
         this.options = options
@@ -46,6 +100,70 @@ export class AnthropicDirectHandler implements ApiHandler {
         }
     }
 
+    private resetStreamState() {
+        this.streamState = {
+            currentText: '',
+            accumulatedContent: [],
+            usage: {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0
+            },
+            isProcessingTool: false
+        }
+    }
+
+    private handleToolResponse(text: string): boolean {
+        // Check for tool tags
+        if (text.includes('<tool') || text.includes('</tool')) {
+            // Start or continue accumulating tool response
+            this.streamState.toolResponse = this.streamState.toolResponse || { 
+                text: '', 
+                complete: false,
+                isCompletionTool: text.includes('attempt_completion')
+            }
+            this.streamState.toolResponse.text += text
+            this.streamState.isProcessingTool = true
+
+            // Check if we have a complete tool tag
+            if (this.streamState.toolResponse.text.includes('</tool>')) {
+                // Add complete tool response to accumulated content
+                this.streamState.accumulatedContent.push({
+                    type: 'text',
+                    text: this.streamState.toolResponse.text
+                })
+                
+                // Keep track of whether this was a completion tool
+                const wasCompletionTool = this.streamState.toolResponse.isCompletionTool
+                
+                // Reset tool response state
+                this.streamState.toolResponse = undefined
+                this.streamState.isProcessingTool = false
+
+                // Return true if this was a completion tool
+                return wasCompletionTool
+            }
+            return false
+        }
+
+        // If we're in the middle of processing a tool but don't have a closing tag yet
+        if (this.streamState.isProcessingTool) {
+            if (this.streamState.toolResponse) {
+                this.streamState.toolResponse.text += text
+            } else {
+                this.streamState.toolResponse = { 
+                    text, 
+                    complete: false,
+                    isCompletionTool: text.includes('attempt_completion')
+                }
+            }
+            return false
+        }
+
+        return false
+    }
+
     async *createMessageStream(
         systemPrompt: string,
         messages: ApiHistoryItem[],
@@ -56,8 +174,10 @@ export class AnthropicDirectHandler implements ApiHandler {
         environmentDetails?: string
     ): AsyncIterableIterator<koduSSEResponse> {
         this.abortController = new AbortController()
+        this.resetStreamState()
 
         try {
+            // Previous system blocks and message setup code remains the same...
             // Build system content blocks with cache control
             const systemBlocks: Anthropic.Beta.PromptCaching.Messages.PromptCachingBetaTextBlockParam[] = []
 
@@ -162,85 +282,140 @@ export class AnthropicDirectHandler implements ApiHandler {
                 }
             )
 
-            let content: Anthropic.ContentBlock[] = []
-            let usage = {
-                input_tokens: 0,
-                output_tokens: 0
-            }
+            let hasProcessedMessage = false
+            let shouldEndStream = false
 
             for await (const chunk of stream) {
-                if (chunk.type === 'message_start') {
-                    if (chunk.message?.usage) {
-                        usage.input_tokens = chunk.message.usage.input_tokens
-                        usage.output_tokens = chunk.message.usage.output_tokens
-                    }
-                    yield { code: 2, body: { text: "" } }
-                } else if (chunk.type === 'content_block_start') {
-                    yield { code: 2, body: { text: "" } }
-                } else if (chunk.type === 'content_block_delta') {
-                    if ('text' in chunk.delta) {
-                        yield { code: 2, body: { text: chunk.delta.text } }
-                        content.push({ type: 'text', text: chunk.delta.text })
-                    }
-                } else if (chunk.type === 'message_delta') {
-                    if ('content' in chunk.delta && Array.isArray(chunk.delta.content)) {
-                        const text = chunk.delta.content
-                            .map((c: { type: string; text?: string }) => (c.type === 'text' && c.text) || '')
-                            .join('')
-                        yield { code: 2, body: { text } }
-                    }
-                    if ('usage' in chunk && chunk.usage?.output_tokens) {
-                        usage.output_tokens = chunk.usage.output_tokens
-                    }
-                } else if (chunk.type === 'message_stop') {
-                    if ('content' in chunk && Array.isArray(chunk.content)) {
+                hasProcessedMessage = true
+                switch (chunk.type) {
+                    case 'message_start':
+                        const message = chunk.message as AnthropicMessage;
+                        if (message?.usage) {
+                            this.streamState.usage.input_tokens = message.usage.input_tokens
+                            this.streamState.usage.output_tokens = message.usage.output_tokens
+                            
+                            if (message.metadata?.cached) {
+                                this.streamState.usage.cache_read_input_tokens = this.streamState.usage.input_tokens
+                            } else {
+                                this.streamState.usage.cache_creation_input_tokens = this.streamState.usage.input_tokens
+                            }
+                        }
+                        yield { code: 2, body: { text: "" } }
+                        break
+
+                    case 'content_block_start':
+                        this.streamState.currentText = ''
+                        yield { code: 2, body: { text: "" } }
+                        break
+
+                    case 'content_block_delta':
+                        if ('text' in chunk.delta) {
+                            const isCompletionTool = this.handleToolResponse(chunk.delta.text)
+                            if (isCompletionTool) {
+                                shouldEndStream = true
+                            }
+                            
+                            if (!this.streamState.isProcessingTool) {
+                                this.streamState.currentText += chunk.delta.text
+                                yield { code: 2, body: { text: chunk.delta.text } }
+                            }
+                        }
+                        break
+
+                    case 'content_block_stop':
+                        if (this.streamState.currentText && !this.streamState.isProcessingTool) {
+                            this.streamState.accumulatedContent.push({
+                                type: 'text',
+                                text: this.streamState.currentText
+                            })
+                            this.streamState.currentText = ''
+                        }
+                        break
+
+                    case 'message_delta':
+                        const delta = chunk.delta as AnthropicDelta;
+                        if (delta.usage?.output_tokens) {
+                            this.streamState.usage.output_tokens = delta.usage.output_tokens
+                        }
+                        if (delta.content && Array.isArray(delta.content)) {
+                            const text = delta.content
+                                .map(c => (c.type === 'text' && c.text) || '')
+                                .join('')
+                            if (text) {
+                                const isCompletionTool = this.handleToolResponse(text)
+                                if (isCompletionTool) {
+                                    shouldEndStream = true
+                                }
+                                if (!this.streamState.isProcessingTool) {
+                                    yield { code: 2, body: { text } }
+                                }
+                            }
+                        }
+                        break
+
+                    case 'message_stop':
+                        // Handle any remaining tool response
+                        if (this.streamState.toolResponse?.text) {
+                            this.streamState.accumulatedContent.push({
+                                type: 'text',
+                                text: this.streamState.toolResponse.text
+                            })
+                        }
+
+                        // Handle any remaining text
+                        if (this.streamState.currentText && !this.streamState.isProcessingTool) {
+                            this.streamState.accumulatedContent.push({
+                                type: 'text',
+                                text: this.streamState.currentText
+                            })
+                        }
+
                         const model = this.getModel()
-                        const inputCost = (model.info.inputPrice / 1_000_000) * usage.input_tokens
-                        const outputCost = (model.info.outputPrice / 1_000_000) * usage.output_tokens
+                        const inputCost = (model.info.inputPrice / 1_000_000) * this.streamState.usage.input_tokens
+                        const outputCost = (model.info.outputPrice / 1_000_000) * this.streamState.usage.output_tokens
                         const totalCost = inputCost + outputCost
 
-                        const metadata = (chunk as any).metadata
-                        const isCached = metadata?.cached === true
-
-                        const cacheCreationInputTokens = isCached ? 0 : usage.input_tokens
-                        const cacheReadInputTokens = isCached ? usage.input_tokens : 0
-
-                        yield {
-                            code: 1,
-                            body: {
-                                anthropic: {
-                                    id: `stream_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-                                    type: 'message',
-                                    role: 'assistant',
-                                    content,
-                                    model: this.getModel().id,
-                                    stop_reason: 'end_turn',
-                                    stop_sequence: null,
-                                    usage: {
-                                        input_tokens: usage.input_tokens,
-                                        output_tokens: usage.output_tokens,
-                                        cache_creation_input_tokens: cacheCreationInputTokens,
-                                        cache_read_input_tokens: cacheReadInputTokens
+                        // Only yield completion if we should end the stream
+                        if (shouldEndStream) {
+                            yield {
+                                code: 1,
+                                body: {
+                                    anthropic: {
+                                        id: `stream_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
+                                        type: 'message',
+                                        role: 'assistant',
+                                        content: this.streamState.accumulatedContent,
+                                        model: this.getModel().id,
+                                        stop_reason: 'end_turn',
+                                        stop_sequence: null,
+                                        usage: {
+                                            input_tokens: this.streamState.usage.input_tokens,
+                                            output_tokens: this.streamState.usage.output_tokens,
+                                            cache_creation_input_tokens: this.streamState.usage.cache_creation_input_tokens,
+                                            cache_read_input_tokens: this.streamState.usage.cache_read_input_tokens
+                                        }
+                                    },
+                                    internal: {
+                                        cost: totalCost,
+                                        userCredits: 0,
+                                        inputTokens: this.streamState.usage.input_tokens,
+                                        outputTokens: this.streamState.usage.output_tokens,
+                                        cacheCreationInputTokens: this.streamState.usage.cache_creation_input_tokens,
+                                        cacheReadInputTokens: this.streamState.usage.cache_read_input_tokens
                                     }
-                                },
-                                internal: {
-                                    cost: totalCost,
-                                    userCredits: 0,
-                                    inputTokens: usage.input_tokens,
-                                    outputTokens: usage.output_tokens,
-                                    cacheCreationInputTokens,
-                                    cacheReadInputTokens
                                 }
                             }
                         }
                         return
-                    }
                 }
             }
 
-            throw new KoduError({
-                code: KODU_ERROR_CODES.NETWORK_REFUSED_TO_CONNECT
-            })
+            // Only throw network error if we haven't processed any messages
+            if (!hasProcessedMessage) {
+                throw new KoduError({
+                    code: KODU_ERROR_CODES.NETWORK_REFUSED_TO_CONNECT
+                })
+            }
 
         } catch (error) {
             if (error instanceof Error && error.message === "aborted") {
@@ -269,6 +444,7 @@ export class AnthropicDirectHandler implements ApiHandler {
             return
         } finally {
             this.abortController = null
+            this.resetStreamState()
         }
     }
 
